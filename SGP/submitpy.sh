@@ -13,5 +13,4 @@ source ~/.bashrc
 conda activate /home/scott.powell/anaconda3/envs/ventana
 
 # Execute the code.
-# time python sgp_eddysizes_noPBLH.py
-time python sgp_eddysizes.py
+time python SGP/generate_event_tables.py --jobs 120
