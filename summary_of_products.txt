@@ -1,0 +1,7 @@
+dlprf
+dlprofwind4news
+dlprofwstats4news
+ceilpblht
+arsclkazr1kollias
+
+Can we use DL data to find rainy periods so we don't need KAZR?

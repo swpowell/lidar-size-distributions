@@ -1,0 +1,154 @@
+import pandas as pd
+from glob import glob
+import numpy as np
+from matplotlib import pyplot as plt
+
+import numpy as np
+
+def bootstrap(data, num_bootstrap_samples=1000, confidence_level=0.95):
+    # Calculate the actual mean of the data
+    actual_mean = np.mean(data)
+    
+    # Generate bootstrap samples and calculate their means
+    bootstrap_means = [np.nanmean(np.random.choice(data, size=len(data), replace=True)) for _ in range(num_bootstrap_samples)]
+    
+    # Calculate the percentiles for the confidence interval
+    lower_percentile = (1 - confidence_level) / 2 * 100
+    upper_percentile = (1 + confidence_level) / 2 * 100
+    confidence_interval = np.percentile(bootstrap_means, [lower_percentile, upper_percentile])
+    
+    return actual_mean, confidence_interval[0], confidence_interval[1]
+
+import numpy as np
+
+def bootstrap_tail_comparison(data1, data2, num_bootstrap_samples=1000, tail_percentile=0.99):
+    # Function to calculate the tail statistic (e.g., 95th percentile)
+    def tail_statistic(data, percentile):
+        return np.nanpercentile(data, percentile * 100)
+    
+    # Generate bootstrap samples and calculate tail statistics
+    bootstrap_tail_stats1 = [tail_statistic(np.random.choice(data1, size=len(data1), replace=True), tail_percentile) for _ in range(num_bootstrap_samples)]
+    bootstrap_tail_stats2 = [tail_statistic(np.random.choice(data2, size=len(data2), replace=True), tail_percentile) for _ in range(num_bootstrap_samples)]
+    
+    # Calculate the difference in tail statistics
+    tail_differences = np.array(bootstrap_tail_stats1) - np.array(bootstrap_tail_stats2)
+    
+    # Calculate the confidence interval for the difference in tail statistics
+    lower_bound = np.percentile(tail_differences, 2.5)
+    upper_bound = np.percentile(tail_differences, 97.5)
+    
+    return lower_bound, upper_bound
+
+# Example usage:
+# Assuming data1 and data2 are numpy arrays containing your inverse exponential data
+# lower_bound, upper_bound = bootstrap_tail_comparison(data1, data2)
+# print(f"95% Confidence Interval for the difference in tails: ({lower_bound}, {upper_bound})")
+
+# Get file list.
+basedir = '/thumper/users/scott.powell/code-data/research-code/lidar/SGP/'
+locations = ['C1']#,'E13','E32','E37','E39','E41']
+fnames = []
+for loc in locations:
+    fnames.append(sorted(glob(basedir+loc+"/*.csv")))
+# fnames = sorted(glob(fdir+"*.csv"))
+fnames = [i for j in fnames for i in j]
+
+# Read each CSV file and concatenate them into a single DataFrame
+# df_list = [pd.read_csv(fname) for fname in fnames[:2142] + fnames[2287:]]
+df_list = [pd.read_csv(fname) for fname in fnames]
+combined_df_reg = pd.concat(df_list, ignore_index=True)
+
+# Heights of most files:
+values_to_keep = np.array([  45.,   75.,  105.,  135.,  165.,  195.,  225.,  255.,  285.,
+        315.,  345.,  375.,  405.,  435.,  465.,  495.,  525.,  555.,
+        585.,  615.,  645.,  675.,  705.,  735.,  765.,  795.,  825.,
+        855.,  885.,  915.,  945.,  975., 1005., 1035., 1065., 1095.,
+       1125., 1155., 1185., 1215., 1245., 1275., 1305., 1335., 1365.,
+       1395., 1425., 1455., 1485., 1515., 1545., 1575., 1605., 1635.,
+       1665., 1695., 1725., 1755., 1785., 1815., 1845., 1875., 1905.,
+       1935., 1965., 1995.,   15.])
+
+# Heights of weird files:
+# values_to_remove = np.array([  30.,   90.,  150.,  210.,  270.,  330.,  390.,  450.,  510.,
+#         570.,  630.,  690.,  750.,  810.,  870.,  930.,  990., 1050.,
+#        1110., 1170., 1230., 1290., 1350., 1410., 1470., 1530., 1590.,
+#        1650., 1710., 1770., 1830., 1890., 1950.])
+
+
+# Remove rows where Height is approximately equal to any value in the array
+mask = np.isclose(combined_df_reg['Height'].values[:, None], values_to_keep, rtol=1e-5, atol=1e-8).any(axis=1)
+combined_df_reg = combined_df_reg[mask]
+
+
+step = 100
+chord_length_hist = {}
+datastore = {}
+# means = []
+pct95 = []
+for pblh in np.arange(300,2600,step):
+    cond = (combined_df['PBL Height'] > pblh) * (combined_df['PBL Height'] <= pblh + step)
+    subset = combined_df[cond]
+    datastore[str(pblh)] = subset
+    chord_length_hist[str(pblh)], bins = np.histogram(subset['Chord Length'],density=True,bins=np.arange(10,201,10))
+    # means.append(bootstrap(subset['Chord Length']))
+    pct95.append(np.nanpercentile(subset['Chord Length'], 50))
+
+# Characterize size by height for a given PBLH.
+hgtbins = np.arange(0,1001,50)
+for key in datastore:
+
+    subset = datastore[key]
+
+    chord = []
+    for hgt in hgtbins:
+        cond = (subset['Height']>hgt) * (subset['Height'] <= hgt+step)
+        chord.append(np.nanpercentile(subset[cond]['Chord Length'],95))
+
+fig, ax = plt.subplots(1,1,figsize=(6,6))
+# ax.plot(chord_length_hist['300'],'b')
+ax.plot(chord_length_hist['600'],'g')
+ax.plot(chord_length_hist['900'],'m')
+ax.plot(chord_length_hist['1200'],'k')
+ax.plot(chord_length_hist['1500'],'r')
+
+
+
+
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import expon
+
+# Function to convert chord length distribution to radii distribution
+def chord_to_radii(chord_lengths, scale):
+    # Define the PDF of the radii (exponential distribution)
+    def pdf_radii(r, scale):
+        return expon.pdf(r, scale=scale)
+    
+    # Define the PDF of the chord lengths given the radii
+    def pdf_chord_given_radii(l, r):
+        return l / (r * np.sqrt(r**2 - (l/2)**2))
+    
+    # Define the joint PDF of chord lengths and radii
+    def joint_pdf(l, r, scale):
+        return pdf_chord_given_radii(l, r) * pdf_radii(r, scale)
+    
+    # Define the marginal PDF of chord lengths
+    def marginal_pdf_chord(l, scale):
+        r_values = np.linspace(l/2, 10, 1000)  # Adjust the range as needed
+        integral = np.array([np.trapz(joint_pdf(l, r_values, scale), r_values) for l in chord_lengths])
+        return integral
+    
+    # Calculate the marginal PDF of chord lengths
+    marginal_pdf = marginal_pdf_chord(chord_lengths, scale)
+    
+    # Normalize the marginal PDF
+    marginal_pdf /= np.trapz(marginal_pdf, chord_lengths)
+    
+    return marginal_pdf
+
+# Convert chord length distribution to radii distribution
+mydata = datastore['1500']['Chord Length']
+scale = np.pi/4 * mydata.mean() # Scale parameter for the exponential distribution
+radii_distribution = chord_to_radii(mydata, scale)
