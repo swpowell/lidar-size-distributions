@@ -4,6 +4,22 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.stats import binom
+
+
+PBL_DEPTH_BINS_M = [400, 800, 1200, 1800, np.inf]
+PBL_DEPTH_LABELS = [
+    "400-800 m",
+    "800-1200 m",
+    "1200-1800 m",
+    ">1800 m",
+]
+PBL_DEPTH_COLORS = {
+    "400-800 m": "#2c7598",
+    "800-1200 m": "#7a8f2a",
+    "1200-1800 m": "#b85f2b",
+    ">1800 m": "#222222",
+}
 
 
 def _load_pyplot():
@@ -36,6 +52,22 @@ def bootstrap_quantile_ci(
     return np.quantile(samples, alpha), np.quantile(samples, 1 - alpha)
 
 
+def quantile_rank_ci(
+    series: pd.Series,
+    quantile: float,
+    *,
+    confidence: float = 0.95,
+) -> tuple[float, float]:
+    clean = pd.to_numeric(series, errors="coerce").dropna().to_numpy(dtype=float)
+    if clean.size == 0:
+        return np.nan, np.nan
+    clean.sort()
+    alpha = 1.0 - confidence
+    lower_rank = int(max(0, binom.ppf(alpha / 2.0, clean.size, quantile) - 1))
+    upper_rank = int(min(clean.size - 1, binom.ppf(1.0 - alpha / 2.0, clean.size, quantile) - 1))
+    return float(clean[lower_rank]), float(clean[upper_rank])
+
+
 def filter_primary_analysis(
     dataframe: pd.DataFrame,
     *,
@@ -66,7 +98,7 @@ def _summarize_groups(grouped, quantile: float, min_count: int) -> pd.DataFrame:
         count = len(group)
         if count < min_count:
             continue
-        lower, upper = bootstrap_quantile_ci(group["chord_length_m"], quantile)
+        lower, upper = quantile_rank_ci(group["chord_length_m"], quantile)
         rows.append(
             {
                 "group": group_value,
@@ -85,18 +117,28 @@ def analyze_h1(
     dataframe: pd.DataFrame,
     *,
     quantile: float = 0.95,
-    pbl_bin_width_m: int = 200,
-    analysis_height_min_m: float = 450,
-    analysis_height_max_m: float = 650,
     min_count: int = 10,
 ) -> pd.DataFrame:
     subset = filter_primary_analysis(dataframe)
-    subset = subset[(subset["height_m"] >= analysis_height_min_m) & (subset["height_m"] <= analysis_height_max_m)]
     subset = subset.dropna(subset=["pbl_height_m"])
-    subset["pbl_bin_m"] = pbl_bin_width_m * np.floor(subset["pbl_height_m"] / pbl_bin_width_m)
-    summary = _summarize_groups(subset.groupby("pbl_bin_m"), quantile, min_count)
+    subset["height_m"] = pd.to_numeric(subset["height_m"], errors="coerce").round()
+    subset["pbl_depth_bin"] = pd.cut(
+        subset["pbl_height_m"],
+        bins=PBL_DEPTH_BINS_M,
+        labels=PBL_DEPTH_LABELS,
+        right=False,
+    )
+    subset = subset.dropna(subset=["height_m", "pbl_depth_bin"])
+    summary = _summarize_groups(subset.groupby(["pbl_depth_bin", "height_m"], observed=True), quantile, min_count)
     if not summary.empty:
-        summary = summary.rename(columns={"group": "pbl_bin_m"}).sort_values("pbl_bin_m")
+        pbl_depth_height = pd.DataFrame(summary["group"].tolist(), columns=["pbl_depth_bin", "height_m"])
+        summary = pd.concat([pbl_depth_height, summary.drop(columns=["group"])], axis=1)
+        summary["pbl_depth_bin"] = pd.Categorical(
+            summary["pbl_depth_bin"],
+            categories=PBL_DEPTH_LABELS,
+            ordered=True,
+        )
+        summary = summary.sort_values(["pbl_depth_bin", "height_m"]).reset_index(drop=True)
     return summary
 
 
@@ -132,12 +174,38 @@ def analyze_h3(
 
 def plot_h1(summary: pd.DataFrame, output_path: str | Path) -> None:
     plt = _load_pyplot()
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.plot(summary["pbl_bin_m"], summary["quantile"], color="black")
-    ax.fill_between(summary["pbl_bin_m"], summary["ci_lower"], summary["ci_upper"], color="0.8")
-    ax.set_xlabel("PBL height bin (m)")
-    ax.set_ylabel("Upper-tail chord length (m)")
-    ax.set_title("H1: Eddy size versus PBL depth")
+    fig, ax = plt.subplots(figsize=(9, 7), dpi=120)
+    max_x = 0.0
+    for label in PBL_DEPTH_LABELS:
+        subset = summary[summary["pbl_depth_bin"].astype(str) == label].sort_values("height_m")
+        if subset.empty:
+            continue
+        color = PBL_DEPTH_COLORS[label]
+        ax.plot(
+            subset["quantile"],
+            subset["height_m"],
+            marker="o",
+            markersize=4,
+            linewidth=2.2,
+            color=color,
+            label=f"{label} (N={int(subset['count'].sum()):,})",
+        )
+        ax.fill_betweenx(
+            subset["height_m"],
+            subset["ci_lower"],
+            subset["ci_upper"],
+            color=color,
+            alpha=0.14,
+            linewidth=0,
+        )
+        max_x = max(max_x, float(subset["ci_upper"].max()))
+    ax.set_xlim(0, max_x * 1.08 if max_x > 0 else 1)
+    ax.set_ylim(0, max(2050, float(summary["height_m"].max()) + 50))
+    ax.set_xlabel("95th-percentile eddy chord length (m)")
+    ax.set_ylabel("Height (m)")
+    ax.set_title("H1: Level-15 resampled eddy size by PBL depth")
+    ax.grid(True, color="0.9", linewidth=1)
+    ax.legend(loc="lower right", frameon=False)
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)

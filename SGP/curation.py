@@ -92,6 +92,8 @@ def _normalize_height_m(series: pd.Series, method: str) -> pd.Series:
 def _parse_event_time(dataframe: pd.DataFrame) -> pd.Series:
     if "Center Datetime" in dataframe.columns:
         return pd.to_datetime(dataframe["Center Datetime"], utc=True, errors="coerce")
+    if "__index_level_0__" in dataframe.columns:
+        return pd.to_datetime(dataframe["__index_level_0__"], utc=True, errors="coerce")
     if "Unnamed: 0" in dataframe.columns:
         return pd.to_datetime(dataframe["Unnamed: 0"], utc=True, errors="coerce")
     if dataframe.index.name:
@@ -99,12 +101,28 @@ def _parse_event_time(dataframe: pd.DataFrame) -> pd.Series:
     return pd.to_datetime(dataframe.index, utc=True, errors="coerce")
 
 
-def _load_event_directory(directory: Path, method: str, location: str) -> pd.DataFrame:
-    files = sorted(directory.glob("*.csv"))
+def _read_event_table(path: Path) -> pd.DataFrame:
+    if path.suffix == ".parquet":
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
+
+
+def _load_event_directory(directory: Path, method: str, location: str, input_format: str = "auto") -> pd.DataFrame:
+    if input_format == "auto":
+        files = sorted(directory.glob("*.parquet"))
+        if not files:
+            files = sorted(directory.glob("*.csv"))
+    else:
+        files = sorted(directory.glob(f"*.{input_format}"))
+    if method == "resampled":
+        method_files = [path for path in files if path.name.startswith("updrafts_resample_")]
+        files = method_files if method_files else files
+    elif method == "regular":
+        files = [path for path in files if not path.name.startswith("updrafts_resample_")]
     if not files:
         return pd.DataFrame()
 
-    frames = [pd.read_csv(path) for path in files]
+    frames = [_read_event_table(path) for path in files]
     dataframe = pd.concat(frames, ignore_index=True)
     dataframe["site"] = location
     dataframe["method"] = method
@@ -131,6 +149,7 @@ def build_curated_dataset(
     *,
     locations: list[str],
     include_methods: tuple[str, ...] = ("regular", "resampled"),
+    input_format: str = "auto",
     cloudy_csv: str | None = None,
     clear_csv: str | None = None,
     add_daylight: bool = True,
@@ -140,9 +159,11 @@ def build_curated_dataset(
     frames = []
     for location in locations:
         if "regular" in include_methods:
-            frames.append(_load_event_directory(root_dir / location, "regular", location))
+            frames.append(_load_event_directory(root_dir / location, "regular", location, input_format=input_format))
         if "resampled" in include_methods:
-            frames.append(_load_event_directory(root_dir / f"{location}_resample", "resampled", location))
+            frames.append(
+                _load_event_directory(root_dir / f"{location}_resample", "resampled", location, input_format=input_format)
+            )
 
     dataframe = pd.concat([frame for frame in frames if not frame.empty], ignore_index=True) if frames else pd.DataFrame()
     if dataframe.empty:

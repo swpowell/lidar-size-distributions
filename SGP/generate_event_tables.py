@@ -26,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--start-date")
     parser.add_argument("--end-date")
+    parser.add_argument("--methods", nargs="+", choices=["regular", "resampled"], default=["regular", "resampled"])
+    parser.add_argument("--output-format", choices=["csv", "parquet"], default="csv")
     return parser.parse_args()
 
 
@@ -51,6 +53,8 @@ def main() -> None:
         threshold=args.threshold,
         start_date=args.start_date,
         end_date=args.end_date,
+        methods=tuple(args.methods),
+        output_format=args.output_format,
     )
     print(f"Processed {len(processed)} dates.")
 

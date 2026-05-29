@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time as timer
 from copy import deepcopy
 from pathlib import Path
 
@@ -11,6 +13,10 @@ from scipy.ndimage import gaussian_filter1d, label
 
 
 INTENSITY_THRESHOLD = 1.008
+
+
+def _joblib_prefer() -> str | None:
+    return os.environ.get("LIDAR_JOBLIB_PREFER") or None
 
 
 def get_date_str(date) -> str:
@@ -93,7 +99,13 @@ def compute_velocity_running_mean_file(
 def lidar_is_raining(lidar: xr.Dataset, radar: xr.Dataset) -> xr.DataArray:
     max_dbz = radar.reflectivity.T[radar.height <= 1500].max(axis=0)
     radar_flag = max_dbz >= 10
-    return radar_flag.sel(time=lidar.time, method="nearest")
+    matched = radar_flag.sel(time=lidar.time, method="nearest")
+    return xr.DataArray(
+        matched.values,
+        coords={"time": lidar.time},
+        dims="time",
+        name="is_raining",
+    )
 
 
 def match_pbl_height(lidar: xr.Dataset, heights_selected: xr.DataArray) -> xr.DataArray:
@@ -128,32 +140,34 @@ def derive_best_pbl_height(pblh: xr.Dataset) -> xr.DataArray:
 
 
 def _process_lidar_time_lidar(
-    lidar_time: xr.DataArray,
-    lidar_ranges: xr.DataArray,
-    wind_times: xr.DataArray,
-    z: xr.DataArray,
-    wind_speed: xr.DataArray,
+    lidar_time: np.datetime64,
+    lidar_ranges: np.ndarray,
+    wind_times: np.ndarray,
+    z: np.ndarray,
+    wind_speed: np.ndarray,
     offset_hours: int = 3,
 ) -> np.ndarray:
-    time_diff = np.abs(wind_times - np.datetime64(lidar_time.values))
-    time_idx = np.argmin(time_diff.values)
+    time_diff = np.abs(wind_times - lidar_time)
+    time_idx = np.argmin(time_diff)
     if time_diff[time_idx] > np.timedelta64(offset_hours, "h"):
         return np.full(len(lidar_ranges), np.nan)
 
-    nearest_height_indices = np.abs(z - lidar_ranges).argmin(axis=0)
-    return wind_speed[time_idx][nearest_height_indices].values
+    nearest_height_indices = np.abs(z[:, None] - lidar_ranges[None, :]).argmin(axis=0)
+    return wind_speed[time_idx][nearest_height_indices]
 
 
 def get_wind_from_lidar(lidar: xr.Dataset, wind: xr.Dataset, jobs: int = 24) -> xr.DataArray:
-    wind_speed = wind.wind_speed
-    wind_times = wind.time
-    z = wind.height
+    wind_speed = wind.wind_speed.values
+    wind_times = wind.time.values
+    z = wind.height.values
     lidar_times = lidar.time
     lidar_ranges = lidar.range
+    lidar_range_values = lidar_ranges.values
+    lidar_time_values = lidar_times.values
 
-    results = Parallel(n_jobs=jobs)(
-        delayed(_process_lidar_time_lidar)(lidar_time, lidar_ranges, wind_times, z, wind_speed)
-        for lidar_time in lidar_times
+    results = Parallel(n_jobs=jobs, prefer=_joblib_prefer())(
+        delayed(_process_lidar_time_lidar)(lidar_time, lidar_range_values, wind_times, z, wind_speed)
+        for lidar_time in lidar_time_values
     )
     lidar_wind_speed = np.vstack(results)
 
@@ -196,15 +210,24 @@ def detect_chords(
     jobs: int = 24,
 ) -> pd.DataFrame:
     time_sec = time_hours * 3600
-    updraft_mask = smoothed_velocity > threshold
-    mask = ~np.isnan(smoothed_velocity)
-    maxz = height_km[mask.any(axis=0).values].max()
+    smoothed_values = smoothed_velocity.values
+    height_values = height_km.values
+    pbl_values = lidar_pbl_height.values if lidar_pbl_height is not None else None
+    updraft_mask = smoothed_values > threshold
+    mask = ~np.isnan(smoothed_values)
+    valid_height_mask = mask.any(axis=0)
+    if not valid_height_mask.any():
+        return pd.DataFrame()
+    maxz = np.nanmax(height_values[valid_height_mask])
+    max_pbl_height = np.nan
+    if pbl_values is not None:
+        max_pbl_height = np.nanmax(pbl_values)
 
-    def process_height(idh: int, height: xr.DataArray) -> list[dict]:
+    def process_height(idh: int, height: float) -> list[dict]:
         records = []
         if height > maxz:
             return records
-        if lidar_pbl_height is not None and height > (lidar_pbl_height.max() / 1000):
+        if np.isfinite(max_pbl_height) and height > (max_pbl_height / 1000):
             return records
 
         upeddies, _ = label(updraft_mask[:, idh])
@@ -220,50 +243,83 @@ def detect_chords(
 
             center_time = int(np.median(t))
             center_time_index = np.argmin(np.abs(time_sec - center_time))
-            if lidar_pbl_height is not None and height * 1000 > lidar_pbl_height[center_time_index]:
+            if pbl_values is not None and height * 1000 > pbl_values[center_time_index]:
                 continue
 
-            cond = np.isnan(smoothed_velocity[idt.min() - 1, idh].values) or np.isnan(
-                smoothed_velocity[idt.max() + 1, idh].values
-            )
+            cond = np.isnan(smoothed_values[idt.min() - 1, idh]) or np.isnan(smoothed_values[idt.max() + 1, idh])
 
             record = {
                 "Updraft ID": eddy,
                 "Center Time": center_time,
-                "Height": float(1000 * height.values),
+                "Height": float(1000 * height),
                 "Chord Time": dt,
                 "Wind Speed": round(float(wind_speed[center_time_index, idh]), 2),
                 "Chord Length": round(float(dt * wind_speed[center_time_index, idh]), 2),
                 "Invalid Adjacent": bool(cond),
             }
-            if lidar_pbl_height is not None:
-                record["PBL Height"] = float(lidar_pbl_height[center_time_index].values)
+            if pbl_values is not None:
+                record["PBL Height"] = float(pbl_values[center_time_index])
             records.append(record)
         return records
 
-    results = Parallel(n_jobs=jobs)(delayed(process_height)(idh, height) for idh, height in enumerate(height_km))
+    results = Parallel(n_jobs=jobs, prefer=_joblib_prefer())(
+        delayed(process_height)(idh, height) for idh, height in enumerate(height_values)
+    )
     return pd.DataFrame([item for sublist in results for item in sublist])
 
 
-def detect_resampled_chords(
-    resampled_level: xr.DataArray,
+def _detect_resampled_chords_impl(
+    resampled_level: xr.DataArray | np.ndarray,
     time_hours: np.ndarray,
     ws500: np.ndarray,
     key: str,
     threshold: float = 0.5,
     lidar_pbl_height: xr.DataArray | None = None,
     min_pbl_height_m: float = 500,
-) -> pd.DataFrame:
-    wprime = resampled_level.values
+    collect_timing: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, dict[str, float]]:
+    total_start = timer.perf_counter()
+    stage_start = timer.perf_counter()
+    wprime = resampled_level.values if hasattr(resampled_level, "values") else resampled_level
     time_sec = time_hours * 3600
     updraft_mask = wprime > threshold
     upeddies, _ = label(updraft_mask)
+    eddy_ids = np.unique(upeddies[upeddies >= 1])[1:]
     updraft_dicts = []
+    pbl_values = lidar_pbl_height.values if lidar_pbl_height is not None else None
+    setup_label_s = timer.perf_counter() - stage_start
 
-    if lidar_pbl_height is not None and lidar_pbl_height.max() < min_pbl_height_m:
-        return pd.DataFrame(updraft_dicts)
+    if pbl_values is not None:
+        max_pbl_height = float(np.nanmax(pbl_values))
+        if np.isfinite(max_pbl_height) and max_pbl_height < min_pbl_height_m:
+            result = pd.DataFrame(updraft_dicts)
+            if collect_timing:
+                return result, {
+                    "height": float(key),
+                    "setup_label_s": setup_label_s,
+                    "eddy_loop_s": 0.0,
+                    "dataframe_s": 0.0,
+                    "total_s": timer.perf_counter() - total_start,
+                    "candidate_eddies": float(len(eddy_ids)),
+                    "rows": 0.0,
+                }
+            return result
+        if not np.isfinite(max_pbl_height):
+            result = pd.DataFrame(updraft_dicts)
+            if collect_timing:
+                return result, {
+                    "height": float(key),
+                    "setup_label_s": setup_label_s,
+                    "eddy_loop_s": 0.0,
+                    "dataframe_s": 0.0,
+                    "total_s": timer.perf_counter() - total_start,
+                    "candidate_eddies": float(len(eddy_ids)),
+                    "rows": 0.0,
+                }
+            return result
 
-    for eddy in np.unique(upeddies[upeddies >= 1])[1:]:
+    stage_start = timer.perf_counter()
+    for eddy in eddy_ids:
         t = time_sec[upeddies == eddy]
         dt = t.max() - t.min()
         if dt <= 0:
@@ -275,7 +331,7 @@ def detect_resampled_chords(
 
         center_time = int(np.median(t))
         center_time_index = np.argmin(np.abs(time_sec - center_time))
-        if lidar_pbl_height is not None and float(key) * 1000 > lidar_pbl_height[center_time_index]:
+        if pbl_values is not None and float(key) * 1000 > pbl_values[center_time_index]:
             continue
 
         cond = np.isnan(wprime[idt.min() - 1]) or np.isnan(wprime[idt.max() + 1])
@@ -288,11 +344,66 @@ def detect_resampled_chords(
             "Chord Length": round(float(dt * ws500[center_time_index]), 2),
             "Invalid Adjacent": bool(cond),
         }
-        if lidar_pbl_height is not None:
-            record["PBL Height"] = float(lidar_pbl_height[center_time_index].values)
+        if pbl_values is not None:
+            record["PBL Height"] = float(pbl_values[center_time_index])
         updraft_dicts.append(record)
+    eddy_loop_s = timer.perf_counter() - stage_start
 
-    return pd.DataFrame(updraft_dicts)
+    stage_start = timer.perf_counter()
+    result = pd.DataFrame(updraft_dicts)
+    dataframe_s = timer.perf_counter() - stage_start
+    if collect_timing:
+        return result, {
+            "height": float(key),
+            "setup_label_s": setup_label_s,
+            "eddy_loop_s": eddy_loop_s,
+            "dataframe_s": dataframe_s,
+            "total_s": timer.perf_counter() - total_start,
+            "candidate_eddies": float(len(eddy_ids)),
+            "rows": float(len(result)),
+        }
+    return result
+
+
+def detect_resampled_chords(
+    resampled_level: xr.DataArray | np.ndarray,
+    time_hours: np.ndarray,
+    ws500: np.ndarray,
+    key: str,
+    threshold: float = 0.5,
+    lidar_pbl_height: xr.DataArray | None = None,
+    min_pbl_height_m: float = 500,
+) -> pd.DataFrame:
+    return _detect_resampled_chords_impl(
+        resampled_level,
+        time_hours,
+        ws500,
+        key,
+        threshold=threshold,
+        lidar_pbl_height=lidar_pbl_height,
+        min_pbl_height_m=min_pbl_height_m,
+    )
+
+
+def detect_resampled_chords_with_timing(
+    resampled_level: xr.DataArray | np.ndarray,
+    time_hours: np.ndarray,
+    ws500: np.ndarray,
+    key: str,
+    threshold: float = 0.5,
+    lidar_pbl_height: xr.DataArray | None = None,
+    min_pbl_height_m: float = 500,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    return _detect_resampled_chords_impl(
+        resampled_level,
+        time_hours,
+        ws500,
+        key,
+        threshold=threshold,
+        lidar_pbl_height=lidar_pbl_height,
+        min_pbl_height_m=min_pbl_height_m,
+        collect_timing=True,
+    )
 
 
 def smooth_and_qc_velocity(
@@ -303,9 +414,9 @@ def smooth_and_qc_velocity(
     intensity_threshold: float = INTENSITY_THRESHOLD,
     sigma: float = 1,
 ) -> tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
-    velocity = lidar.variables["wprime"][:]
-    intensity = lidar.variables["intensity"][:]
-    height_km = lidar.variables["range"][:] / 1000
+    velocity = lidar["wprime"]
+    intensity = lidar["intensity"]
+    height_km = lidar["range"] / 1000
 
     smoothed = deepcopy(velocity)
     smoothed[:] = simple_smoother(velocity, sigma=sigma)

@@ -28,7 +28,11 @@ PRECIP_CODES = {
     "SNRA",
 }
 FOG_CODES = {"FG", "FZFG"}
+OBSCURATION_CODES = {"BR", "HZ", "FU", "DU", "SA", "VA", "PY"}
+THUNDER_SHOWER_CODES = {"TS", "SH", "VCTS", "VCSH", "TSB", "TSE"}
+STRICT_WEATHER_EXCLUSION_CODES = PRECIP_CODES | FOG_CODES | OBSCURATION_CODES | THUNDER_SHOWER_CODES
 CLOUD_RE = re.compile(r"\b(?P<type>FEW|SCT|BKN|OVC|SKC|CLR)(?P<base>\d{3})?\b")
+VV_RE = re.compile(r"\bVV\d{3}\b")
 METAR_TG_RE = re.compile(r"\b(?P<ddhhmm>\d{6})Z\b")
 DT_PATTERNS = [
     re.compile(r"(?P<dt>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)"),
@@ -53,6 +57,66 @@ def has_precip(metar: str) -> bool:
 
 def has_fog(metar: str) -> bool:
     return any(code in metar.split() for code in FOG_CODES)
+
+
+def _weather_tokens(metar: str) -> list[str]:
+    tokens = re.findall(r"\+?-?[A-Z]{2,6}", metar)
+    return [token.replace("+", "").replace("-", "") for token in tokens]
+
+
+def has_vertical_visibility(metar: str) -> bool:
+    return bool(VV_RE.search(metar))
+
+
+def has_excluded_weather(metar: str) -> bool:
+    for token in _weather_tokens(metar):
+        if token in STRICT_WEATHER_EXCLUSION_CODES:
+            return True
+        if token.startswith(("TS", "SH", "VC")):
+            return True
+        if any(code in token for code in PRECIP_CODES):
+            return True
+    return False
+
+
+def is_cumuliform_proxy(
+    metar: str,
+    *,
+    base_min_hundreds_ft: int = 8,
+    base_max_hundreds_ft: int = 15,
+) -> bool:
+    if has_excluded_weather(metar) or has_vertical_visibility(metar):
+        return False
+
+    layers = parse_clouds(metar)
+    if not layers:
+        return False
+
+    for cloud_type, base in layers:
+        if cloud_type == "OVC":
+            return False
+        if base is not None and base < base_min_hundreds_ft:
+            return False
+
+    return any(
+        cloud_type in {"SCT", "BKN"}
+        and base is not None
+        and base_min_hundreds_ft <= base <= base_max_hundreds_ft
+        for cloud_type, base in layers
+    )
+
+
+def is_strict_clear(metar: str) -> bool:
+    if has_excluded_weather(metar) or has_vertical_visibility(metar):
+        return False
+
+    layers = parse_clouds(metar)
+    if not layers:
+        return True
+    layer_types = {cloud_type for cloud_type, _ in layers}
+    if layer_types & {"FEW", "SCT", "BKN", "OVC"}:
+        return False
+    return bool(layer_types & {"CLR", "SKC"})
 
 
 def meets_bkn_sct_criteria(metar: str, base_min_hundreds_ft: int = 8, base_max_hundreds_ft: int = 15) -> bool:
